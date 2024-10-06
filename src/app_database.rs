@@ -5,6 +5,7 @@ use diesel::{
     sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text, Unsigned},
     MysqlConnection, RunQueryDsl,
 };
+use tokio::time::Instant;
 use tracing::{error, info};
 
 use crate::{models, InsertReward, Miner, SubmissionWithId};
@@ -130,18 +131,30 @@ impl AppDatabase {
         &self,
         rewards: Vec<models::UpdateReward>,
     ) -> Result<(), AppDatabaseError> {
-        let mut query = String::new();
-        for reward in rewards {
-            query.push_str(&format!(
-                "UPDATE rewards SET balance = balance + {} WHERE miner_id = {};",
-                reward.balance, reward.miner_id
-            ));
-        }
-
+        let id = uuid::Uuid::new_v4();
+        let instant = Instant::now();
+        tracing::info!(target: "server_log", "{} - Getting db pool connection.", id);
         if let Ok(db_conn) = self.connection_pool.get().await {
-            let conn_query = query.clone();
+            tracing::info!(target: "server_log", "{} - Got db pool connection in {}ms.", id, instant.elapsed().as_millis());
             let res = db_conn
-                .interact(move |conn: &mut MysqlConnection| conn.batch_execute(&conn_query))
+                .interact(move |conn: &mut MysqlConnection| {
+                    let query = diesel::sql_query(
+                        "UPDATE rewards SET balance = balance + CASE miner_id ".to_string() +
+                        &rewards
+                            .iter()
+                            .map(|r| format!("WHEN {} THEN {}", r.miner_id, r.balance))
+                            .collect::<Vec<_>>()
+                            .join(" ") +
+                        " END WHERE miner_id IN (" +
+                        &rewards
+                            .iter()
+                            .map(|r| r.miner_id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",") +
+                        ")"
+                    );
+                    query.execute(conn)
+                })
                 .await;
 
             match res {
@@ -150,13 +163,12 @@ impl AppDatabase {
                         return Ok(());
                     }
                     Err(e) => {
-                        error!(target: "server_log", "{:?}", e);
-                        error!(target: "server_log", "QUERY: {}", query);
+                        error!(target: "server_log", "update rewards query error: {:?}", e);
                         return Err(AppDatabaseError::QueryFailed);
                     }
                 },
                 Err(e) => {
-                    error!(target: "server_log", "{:?}", e);
+                    error!(target: "server_log", "update rewards interaction error: {:?}", e);
                     return Err(AppDatabaseError::InteractionFailed);
                 }
             }
